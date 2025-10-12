@@ -16,6 +16,7 @@ public sealed class ApplicationSettings
 public sealed class GateSettings
 {
     public string Id { get; init; } = string.Empty;
+    public string Type { get; init; } = "IN";
     public string ControllerHost { get; init; } = string.Empty;
     public int ControllerPort { get; init; }
     public string OpenCommand { get; init; } = "OPEN";
@@ -24,7 +25,8 @@ public sealed class GateSettings
 public sealed class ApiSettings
 {
     public string BaseUrl { get; init; } = string.Empty;
-    public string ValidateEndpoint { get; init; } = string.Empty;
+    public string GateInEndpoint { get; init; } = string.Empty;
+    public string GateOutEndpoint { get; init; } = string.Empty;
     public string CaptureEndpoint { get; init; } = string.Empty;
     public string ApiKey { get; init; } = string.Empty;
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(15);
