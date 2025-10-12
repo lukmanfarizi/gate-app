@@ -1,4 +1,6 @@
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using System.Text;
@@ -13,61 +15,52 @@ namespace GateApp.Services;
 
 public sealed class ApiService : IDisposable
 {
-    private readonly HttpClient _httpClient;
     private readonly ILogger _logger;
-    private readonly ApiSettings _settings;
-    private readonly AsyncRetryPolicy<HttpResponseMessage> _httpRetryPolicy;
+    private readonly Dictionary<string, ApiClientContext> _apiClients;
     private bool _disposed;
 
     public ApiService(IConfiguration configuration, ILogger logger)
     {
         _logger = logger;
-        _settings = configuration.GetSection("Api").Get<ApiSettings>() ?? new ApiSettings();
-        if (string.IsNullOrWhiteSpace(_settings.BaseUrl))
-        {
-            throw new InvalidOperationException("API BaseUrl is not configured.");
-        }
+        _apiClients = new Dictionary<string, ApiClientContext>(StringComparer.OrdinalIgnoreCase);
 
-        _httpClient = new HttpClient
-        {
-            BaseAddress = new Uri(_settings.BaseUrl),
-            Timeout = _settings.Timeout
-        };
+        var apisSection = configuration.GetSection("Apis");
+        var apiChildren = apisSection.GetChildren().ToList();
 
-        if (!string.IsNullOrWhiteSpace(_settings.ApiKey))
+        if (apiChildren.Count > 0)
         {
-            _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _settings.ApiKey);
-        }
-
-        var retryCount = Math.Max(0, _settings.RetryCount);
-        var baseDelay = _settings.RetryBackoffSeconds <= 0 ? 1 : _settings.RetryBackoffSeconds;
-        _httpRetryPolicy = Policy<HttpResponseMessage>
-            .Handle<HttpRequestException>()
-            .Or<TaskCanceledException>()
-            .OrResult(response => (int)response.StatusCode >= 500)
-            .WaitAndRetryAsync(
-                retryCount,
-                attempt => TimeSpan.FromSeconds(baseDelay * Math.Pow(2, attempt - 1)),
-                (outcome, span, attempt, _) =>
+            foreach (var apiSection in apiChildren)
+            {
+                var name = apiSection.Key;
+                var settings = apiSection.Get<ApiSettings>() ?? new ApiSettings();
+                if (string.IsNullOrWhiteSpace(name))
                 {
-                    if (outcome.Exception is not null)
-                    {
-                        _logger.Warning(outcome.Exception, "HTTP request failed on attempt {Attempt}. Retrying in {Delay}.", attempt, span);
-                    }
-                    else
-                    {
-                        _logger.Warning("HTTP request returned status {Status} on attempt {Attempt}. Retrying in {Delay}.", outcome.Result.StatusCode, attempt, span);
-                    }
-                });
+                    continue;
+                }
+
+                _apiClients[name] = CreateClientContext(name, settings);
+            }
+        }
+        else
+        {
+            var legacySettings = configuration.GetSection("Api").Get<ApiSettings>() ?? new ApiSettings();
+            _apiClients["Default"] = CreateClientContext("Default", legacySettings);
+        }
+
+        if (_apiClients.Count == 0)
+        {
+            throw new InvalidOperationException("No API clients are configured.");
+        }
     }
 
     public async Task<ValidateResponse?> ValidateAsync(ValidateRequest request, CancellationToken cancellationToken)
     {
         try
         {
-            _logger.Information("Sending validate request for QR {QrCode}", request.QrCode);
-            using var response = await _httpRetryPolicy
-                .ExecuteAsync(ct => _httpClient.PostAsJsonAsync(_settings.ValidateEndpoint, request, ct), cancellationToken)
+            var client = GetApiClientForQrCode(request.QrCode);
+            _logger.Information("Sending validate request for QR {QrCode} using {ApiName}", request.QrCode, client.Name);
+            using var response = await client.RetryPolicy
+                .ExecuteAsync(ct => client.HttpClient.PostAsJsonAsync(client.Settings.ValidateEndpoint, request, ct), cancellationToken)
                 .ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
@@ -94,19 +87,26 @@ public sealed class ApiService : IDisposable
         }
     }
 
-    public async Task<bool> SendCaptureAsync(string ticketId, string gateId, IDictionary<string, byte[]> snapshots, IDictionary<string, string>? additionalPayload, CancellationToken cancellationToken)
+    public async Task<bool> SendCaptureAsync(
+        string qrCode,
+        string ticketId,
+        string gateId,
+        IDictionary<string, byte[]> snapshots,
+        IDictionary<string, string>? additionalPayload,
+        CancellationToken cancellationToken)
     {
         try
         {
+            var client = GetApiClientForQrCode(qrCode);
             var capturedAtInstant = DateTime.UtcNow;
             var capturedAt = capturedAtInstant.ToString("O");
-            using var response = await _httpRetryPolicy
+            using var response = await client.RetryPolicy
                 .ExecuteAsync(async ct =>
                 {
                     var content = BuildCaptureForm(ticketId, gateId, capturedAt, capturedAtInstant, snapshots, additionalPayload);
                     try
                     {
-                        return await _httpClient.PostAsync(_settings.CaptureEndpoint, content, ct).ConfigureAwait(false);
+                        return await client.HttpClient.PostAsync(client.Settings.CaptureEndpoint, content, ct).ConfigureAwait(false);
                     }
                     finally
                     {
@@ -121,7 +121,7 @@ public sealed class ApiService : IDisposable
                 return false;
             }
 
-            _logger.Information("Capture uploaded for ticket {TicketId}", ticketId);
+            _logger.Information("Capture uploaded for ticket {TicketId} using {ApiName}", ticketId, client.Name);
             return true;
         }
         catch (Exception ex)
@@ -138,7 +138,11 @@ public sealed class ApiService : IDisposable
             return;
         }
 
-        _httpClient.Dispose();
+        foreach (var client in _apiClients.Values)
+        {
+            client.Dispose();
+        }
+
         _disposed = true;
     }
 
@@ -174,5 +178,119 @@ public sealed class ApiService : IDisposable
         }
 
         return form;
+    }
+
+    private ApiClientContext GetApiClientForQrCode(string qrCode)
+    {
+        if (string.IsNullOrWhiteSpace(qrCode))
+        {
+            if (_apiClients.Count == 1)
+            {
+                return _apiClients.Values.First();
+            }
+
+            throw new InvalidOperationException("QR code is required to determine the API client.");
+        }
+
+        var key = DetermineApiKey(qrCode);
+        if (key is null)
+        {
+            if (_apiClients.Count == 1)
+            {
+                return _apiClients.Values.First();
+            }
+
+            throw new InvalidOperationException($"No API mapping found for QR code '{qrCode}'.");
+        }
+
+        if (_apiClients.TryGetValue(key, out var client))
+        {
+            return client;
+        }
+
+        throw new InvalidOperationException($"API configuration '{key}' is not defined.");
+    }
+
+    private static string? DetermineApiKey(string qrCode)
+    {
+        if (qrCode.Contains("/DWI/", StringComparison.OrdinalIgnoreCase))
+        {
+            return "Dss";
+        }
+
+        if (qrCode.Contains("/DW/", StringComparison.OrdinalIgnoreCase))
+        {
+            return "DwiMados";
+        }
+
+        if (qrCode.Contains("/RC/", StringComparison.OrdinalIgnoreCase))
+        {
+            return "EirMados";
+        }
+
+        return null;
+    }
+
+    private ApiClientContext CreateClientContext(string name, ApiSettings settings)
+    {
+        if (string.IsNullOrWhiteSpace(settings.BaseUrl))
+        {
+            throw new InvalidOperationException($"API BaseUrl is not configured for '{name}'.");
+        }
+
+        var httpClient = new HttpClient
+        {
+            BaseAddress = new Uri(settings.BaseUrl),
+            Timeout = settings.Timeout
+        };
+
+        if (!string.IsNullOrWhiteSpace(settings.ApiKey))
+        {
+            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
+        }
+
+        var retryCount = Math.Max(0, settings.RetryCount);
+        var baseDelay = settings.RetryBackoffSeconds <= 0 ? 1 : settings.RetryBackoffSeconds;
+        var retryPolicy = Policy<HttpResponseMessage>
+            .Handle<HttpRequestException>()
+            .Or<TaskCanceledException>()
+            .OrResult(response => (int)response.StatusCode >= 500)
+            .WaitAndRetryAsync(
+                retryCount,
+                attempt => TimeSpan.FromSeconds(baseDelay * Math.Pow(2, attempt - 1)),
+                (outcome, span, attempt, _) =>
+                {
+                    if (outcome.Exception is not null)
+                    {
+                        _logger.Warning(outcome.Exception, "HTTP request failed on attempt {Attempt} for {ApiName}. Retrying in {Delay}.", attempt, name, span);
+                    }
+                    else
+                    {
+                        _logger.Warning("HTTP request returned status {Status} on attempt {Attempt} for {ApiName}. Retrying in {Delay}.", outcome.Result.StatusCode, attempt, name, span);
+                    }
+                });
+
+        return new ApiClientContext(name, settings, httpClient, retryPolicy);
+    }
+
+    private sealed class ApiClientContext : IDisposable
+    {
+        public ApiClientContext(string name, ApiSettings settings, HttpClient httpClient, AsyncRetryPolicy<HttpResponseMessage> retryPolicy)
+        {
+            Name = name;
+            Settings = settings;
+            HttpClient = httpClient;
+            RetryPolicy = retryPolicy;
+        }
+
+        public string Name { get; }
+        public ApiSettings Settings { get; }
+        public HttpClient HttpClient { get; }
+        public AsyncRetryPolicy<HttpResponseMessage> RetryPolicy { get; }
+
+        public void Dispose()
+        {
+            HttpClient.Dispose();
+        }
     }
 }

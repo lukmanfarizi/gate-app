@@ -6,6 +6,7 @@ public sealed class ApplicationSettings
 {
     public GateSettings Gate { get; init; } = new();
     public ApiSettings Api { get; init; } = new();
+    public IReadOnlyDictionary<string, ApiSettings> Apis { get; init; } = new Dictionary<string, ApiSettings>();
     public IReadOnlyList<CameraConfiguration> Cameras { get; init; } = Array.Empty<CameraConfiguration>();
     public ScannerSettings Scanner { get; init; } = new();
     public PrintingSettings Printing { get; init; } = new();
