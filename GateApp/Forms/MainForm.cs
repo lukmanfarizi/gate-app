@@ -47,8 +47,7 @@ public partial class MainForm : Form
     private void InitializeServices()
     {
         _cameraService.Initialize(new[] { pictureBox1, pictureBox2, pictureBox3, pictureBox4 });
-        _scannerService.QrCodeReceived += ScannerServiceOnQrCodeReceived;
-        scannerTextBox.KeyPress += ScannerTextBoxOnKeyPress;
+        scannerTextBox.KeyDown += ScannerTextBoxOnKeyDown;
         scannerTextBox.GotFocus += ScannerTextBoxOnGotFocus;
         scannerTextBox.LostFocus += ScannerTextBoxOnLostFocus;
         Activated += (_, _) => FocusScanner();
@@ -75,15 +74,19 @@ public partial class MainForm : Form
         LogMessage("GateApp ready. Waiting for scans...");
     }
 
-    private void ScannerServiceOnQrCodeReceived(object? sender, string qrCode)
+    private void ScannerTextBoxOnKeyDown(object? sender, KeyEventArgs e)
     {
-        _ = HandleQrCodeAsync(qrCode);
-    }
+        if (e.KeyCode != Keys.Enter)
+        {
+            return;
+        }
 
-    private void ScannerTextBoxOnKeyPress(object? sender, KeyPressEventArgs e)
-    {
-        _scannerService.ProcessCharacter(e.KeyChar);
         e.Handled = true;
+        e.SuppressKeyPress = true;
+        var qrCode = scannerTextBox.Text.Trim();
+        scannerTextBox.Clear();
+
+        _ = HandleQrCodeAsync(qrCode);
     }
 
     private async Task HandleQrCodeAsync(string qrCode)
@@ -277,8 +280,7 @@ public partial class MainForm : Form
     {
         _operationCts?.Cancel();
         _lifetimeCts.Cancel();
-        _scannerService.QrCodeReceived -= ScannerServiceOnQrCodeReceived;
-        scannerTextBox.KeyPress -= ScannerTextBoxOnKeyPress;
+        scannerTextBox.KeyDown -= ScannerTextBoxOnKeyDown;
         scannerTextBox.GotFocus -= ScannerTextBoxOnGotFocus;
         scannerTextBox.LostFocus -= ScannerTextBoxOnLostFocus;
         topPanel.MouseDown -= ControlOnMouseDown;
