@@ -17,12 +17,18 @@ public sealed class ApiService : IDisposable
 {
     private readonly ILogger _logger;
     private readonly Dictionary<string, ApiClientContext> _apiClients;
+    private readonly string _gateDirection;
     private bool _disposed;
 
     public ApiService(IConfiguration configuration, ILogger logger)
     {
         _logger = logger;
         _apiClients = new Dictionary<string, ApiClientContext>(StringComparer.OrdinalIgnoreCase);
+        _gateDirection = configuration["Gate:Type"];
+        if (string.IsNullOrWhiteSpace(_gateDirection))
+        {
+            _gateDirection = "IN";
+        }
 
         var apisSection = configuration.GetSection("Apis");
         var apiChildren = apisSection.GetChildren().ToList();
@@ -59,8 +65,10 @@ public sealed class ApiService : IDisposable
         {
             var client = GetApiClientForQrCode(request.QrCode);
             _logger.Information("Sending validate request for QR {QrCode} using {ApiName}", request.QrCode, client.Name);
+            var endpoint = GetGateEndpoint(client);
+            var endpointUri = ResolveEndpoint(client, endpoint);
             using var response = await client.RetryPolicy
-                .ExecuteAsync(ct => client.HttpClient.PostAsJsonAsync(client.Settings.ValidateEndpoint, request, ct), cancellationToken)
+                .ExecuteAsync(ct => client.HttpClient.PostAsJsonAsync(endpointUri, request, ct), cancellationToken)
                 .ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
             {
@@ -103,10 +111,16 @@ public sealed class ApiService : IDisposable
             using var response = await client.RetryPolicy
                 .ExecuteAsync(async ct =>
                 {
+                    if (string.IsNullOrWhiteSpace(client.Settings.CaptureEndpoint))
+                    {
+                        throw new InvalidOperationException($"Capture endpoint is not configured for API '{client.Name}'.");
+                    }
+
+                    var endpointUri = ResolveEndpoint(client, client.Settings.CaptureEndpoint);
                     var content = BuildCaptureForm(ticketId, gateId, capturedAt, capturedAtInstant, snapshots, additionalPayload);
                     try
                     {
-                        return await client.HttpClient.PostAsync(client.Settings.CaptureEndpoint, content, ct).ConfigureAwait(false);
+                        return await client.HttpClient.PostAsync(endpointUri, content, ct).ConfigureAwait(false);
                     }
                     finally
                     {
@@ -229,6 +243,54 @@ public sealed class ApiService : IDisposable
         }
 
         return null;
+    }
+
+    private string GetGateEndpoint(ApiClientContext client)
+    {
+        var direction = _gateDirection;
+        if (string.Equals(direction, "OUT", StringComparison.OrdinalIgnoreCase))
+        {
+            if (!string.IsNullOrWhiteSpace(client.Settings.GateOutEndpoint))
+            {
+                return client.Settings.GateOutEndpoint;
+            }
+
+            if (!string.IsNullOrWhiteSpace(client.Settings.GateInEndpoint))
+            {
+                _logger.Warning("Gate OUT endpoint not configured for {ApiName}. Falling back to Gate IN endpoint.", client.Name);
+                return client.Settings.GateInEndpoint;
+            }
+
+            throw new InvalidOperationException($"No Gate OUT endpoint configured for API '{client.Name}'.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(client.Settings.GateInEndpoint))
+        {
+            return client.Settings.GateInEndpoint;
+        }
+
+        if (!string.IsNullOrWhiteSpace(client.Settings.GateOutEndpoint))
+        {
+            _logger.Warning("Gate IN endpoint not configured for {ApiName}. Falling back to Gate OUT endpoint.", client.Name);
+            return client.Settings.GateOutEndpoint;
+        }
+
+        throw new InvalidOperationException($"No Gate IN endpoint configured for API '{client.Name}'.");
+    }
+
+    private static Uri ResolveEndpoint(ApiClientContext client, string endpoint)
+    {
+        if (Uri.TryCreate(endpoint, UriKind.Absolute, out var absolute))
+        {
+            return absolute;
+        }
+
+        if (client.HttpClient.BaseAddress is null)
+        {
+            throw new InvalidOperationException("API BaseUrl must be configured when using relative endpoints.");
+        }
+
+        return new Uri(client.HttpClient.BaseAddress, endpoint);
     }
 
     private ApiClientContext CreateClientContext(string name, ApiSettings settings)
