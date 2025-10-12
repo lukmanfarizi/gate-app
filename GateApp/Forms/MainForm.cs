@@ -163,7 +163,8 @@ public partial class MainForm : Form
             LogMessage($"Captured {snapshots.Count} snapshots");
 
             await InvokeAsync(() => UpdateStatus(apiStatusLabel, "API: Uploading Capture")).ConfigureAwait(false);
-            var captureUploaded = await _apiService.SendCaptureAsync(validateResponse.TicketId ?? qrCode,
+            var captureUploaded = await _apiService.SendCaptureAsync(qrCode,
+                                                                     validateResponse.TicketId ?? qrCode,
                                                                      _settings.Gate.Id,
                                                                      snapshots,
                                                                      additionalPayload,
