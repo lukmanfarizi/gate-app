@@ -2,7 +2,6 @@ using System.IO;
 using GateApp.Models;
 using Microsoft.Extensions.Configuration;
 using Serilog;
-using Serilog.Core;
 using Serilog.Events;
 
 namespace GateApp.Services;
