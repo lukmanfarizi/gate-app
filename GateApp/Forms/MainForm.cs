@@ -49,7 +49,19 @@ public partial class MainForm : Form
         _cameraService.Initialize(new[] { pictureBox1, pictureBox2, pictureBox3, pictureBox4 });
         _scannerService.QrCodeReceived += ScannerServiceOnQrCodeReceived;
         scannerTextBox.KeyPress += ScannerTextBoxOnKeyPress;
-        scannerTextBox.GotFocus += (_, _) => scannerTextBox.Select(scannerTextBox.TextLength, 0);
+        scannerTextBox.GotFocus += ScannerTextBoxOnGotFocus;
+        scannerTextBox.LostFocus += ScannerTextBoxOnLostFocus;
+        Activated += (_, _) => FocusScanner();
+        topPanel.MouseDown += ControlOnMouseDown;
+        scannerLabel.MouseDown += ControlOnMouseDown;
+        tableLayoutPanel.MouseDown += ControlOnMouseDown;
+        bottomPanel.MouseDown += ControlOnMouseDown;
+        logTextBox.MouseDown += ControlOnMouseDown;
+        statusStrip.MouseDown += ControlOnMouseDown;
+        pictureBox1.MouseDown += ControlOnMouseDown;
+        pictureBox2.MouseDown += ControlOnMouseDown;
+        pictureBox3.MouseDown += ControlOnMouseDown;
+        pictureBox4.MouseDown += ControlOnMouseDown;
     }
 
     private void MainForm_Shown(object? sender, EventArgs e)
@@ -201,6 +213,7 @@ public partial class MainForm : Form
             _operationCts?.Dispose();
             _operationCts = null;
             _processingSemaphore.Release();
+            FocusScanner();
         }
     }
 
@@ -266,5 +279,32 @@ public partial class MainForm : Form
         _lifetimeCts.Cancel();
         _scannerService.QrCodeReceived -= ScannerServiceOnQrCodeReceived;
         scannerTextBox.KeyPress -= ScannerTextBoxOnKeyPress;
+        scannerTextBox.GotFocus -= ScannerTextBoxOnGotFocus;
+        scannerTextBox.LostFocus -= ScannerTextBoxOnLostFocus;
+        topPanel.MouseDown -= ControlOnMouseDown;
+        scannerLabel.MouseDown -= ControlOnMouseDown;
+        tableLayoutPanel.MouseDown -= ControlOnMouseDown;
+        bottomPanel.MouseDown -= ControlOnMouseDown;
+        logTextBox.MouseDown -= ControlOnMouseDown;
+        statusStrip.MouseDown -= ControlOnMouseDown;
+        pictureBox1.MouseDown -= ControlOnMouseDown;
+        pictureBox2.MouseDown -= ControlOnMouseDown;
+        pictureBox3.MouseDown -= ControlOnMouseDown;
+        pictureBox4.MouseDown -= ControlOnMouseDown;
+    }
+
+    private void ScannerTextBoxOnGotFocus(object? sender, EventArgs e)
+    {
+        scannerTextBox.Select(scannerTextBox.TextLength, 0);
+    }
+
+    private void ScannerTextBoxOnLostFocus(object? sender, EventArgs e)
+    {
+        FocusScanner();
+    }
+
+    private void ControlOnMouseDown(object? sender, MouseEventArgs e)
+    {
+        FocusScanner();
     }
 }

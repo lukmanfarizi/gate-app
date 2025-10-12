@@ -7,6 +7,8 @@ partial class MainForm
 {
     private System.ComponentModel.IContainer components = null!;
     private TableLayoutPanel tableLayoutPanel;
+    private Panel topPanel;
+    private Label scannerLabel;
     private PictureBox pictureBox1;
     private PictureBox pictureBox2;
     private PictureBox pictureBox3;
@@ -33,6 +35,8 @@ partial class MainForm
     {
         components = new System.ComponentModel.Container();
         tableLayoutPanel = new TableLayoutPanel();
+        topPanel = new Panel();
+        scannerLabel = new Label();
         pictureBox1 = new PictureBox();
         pictureBox2 = new PictureBox();
         pictureBox3 = new PictureBox();
@@ -45,6 +49,7 @@ partial class MainForm
         cameraStatusLabel = new ToolStripStatusLabel();
         gateStatusLabel = new ToolStripStatusLabel();
         tableLayoutPanel.SuspendLayout();
+        topPanel.SuspendLayout();
         ((System.ComponentModel.ISupportInitialize)pictureBox1).BeginInit();
         ((System.ComponentModel.ISupportInitialize)pictureBox2).BeginInit();
         ((System.ComponentModel.ISupportInitialize)pictureBox3).BeginInit();
@@ -54,7 +59,7 @@ partial class MainForm
         SuspendLayout();
         // 
         // tableLayoutPanel
-        // 
+        //
         tableLayoutPanel.ColumnCount = 2;
         tableLayoutPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
         tableLayoutPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50F));
@@ -63,16 +68,39 @@ partial class MainForm
         tableLayoutPanel.Controls.Add(pictureBox3, 0, 1);
         tableLayoutPanel.Controls.Add(pictureBox4, 1, 1);
         tableLayoutPanel.Dock = DockStyle.Fill;
-        tableLayoutPanel.Location = new Point(0, 0);
+        tableLayoutPanel.Location = new Point(0, 60);
         tableLayoutPanel.Name = "tableLayoutPanel";
         tableLayoutPanel.RowCount = 2;
         tableLayoutPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
         tableLayoutPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
-        tableLayoutPanel.Size = new Size(1280, 720);
+        tableLayoutPanel.Size = new Size(1280, 660);
         tableLayoutPanel.TabIndex = 0;
-        // 
+        //
+        // topPanel
+        //
+        topPanel.Controls.Add(scannerTextBox);
+        topPanel.Controls.Add(scannerLabel);
+        topPanel.Dock = DockStyle.Top;
+        topPanel.Height = 60;
+        topPanel.Padding = new Padding(10, 10, 10, 5);
+        topPanel.Name = "topPanel";
+        topPanel.TabIndex = 3;
+        //
+        // scannerLabel
+        //
+        scannerLabel.AutoSize = true;
+        scannerLabel.Dock = DockStyle.Left;
+        scannerLabel.Font = new Font("Segoe UI", 12F, FontStyle.Bold, GraphicsUnit.Point);
+        scannerLabel.Location = new Point(10, 10);
+        scannerLabel.Margin = new Padding(0, 0, 10, 0);
+        scannerLabel.Name = "scannerLabel";
+        scannerLabel.Padding = new Padding(0, 5, 0, 0);
+        scannerLabel.Size = new Size(132, 26);
+        scannerLabel.TabIndex = 0;
+        scannerLabel.Text = "Scan QR Code:";
+        //
         // pictureBox1
-        // 
+        //
         pictureBox1.Dock = DockStyle.Fill;
         pictureBox1.BackColor = Color.Black;
         pictureBox1.SizeMode = PictureBoxSizeMode.Zoom;
@@ -102,7 +130,6 @@ partial class MainForm
         // bottomPanel
         // 
         bottomPanel.Controls.Add(logTextBox);
-        bottomPanel.Controls.Add(scannerTextBox);
         bottomPanel.Controls.Add(statusStrip);
         bottomPanel.Dock = DockStyle.Bottom;
         bottomPanel.Height = 220;
@@ -121,10 +148,12 @@ partial class MainForm
         logTextBox.TabIndex = 0;
         // 
         // scannerTextBox
-        // 
-        scannerTextBox.Dock = DockStyle.Bottom;
-        scannerTextBox.Visible = false;
+        //
+        scannerTextBox.Dock = DockStyle.Fill;
+        scannerTextBox.Font = new Font("Consolas", 18F, FontStyle.Regular, GraphicsUnit.Point);
+        scannerTextBox.Margin = new Padding(10, 0, 0, 0);
         scannerTextBox.TabIndex = 1;
+        scannerTextBox.TabStop = false;
         // 
         // statusStrip
         // 
@@ -156,6 +185,7 @@ partial class MainForm
         ClientSize = new Size(1280, 940);
         Controls.Add(tableLayoutPanel);
         Controls.Add(bottomPanel);
+        Controls.Add(topPanel);
         Name = "MainForm";
         Text = "GateApp";
         WindowState = FormWindowState.Maximized;
@@ -170,6 +200,9 @@ partial class MainForm
         bottomPanel.PerformLayout();
         statusStrip.ResumeLayout(false);
         statusStrip.PerformLayout();
+        topPanel.ResumeLayout(false);
+        topPanel.PerformLayout();
         ResumeLayout(false);
+        PerformLayout();
     }
 }
