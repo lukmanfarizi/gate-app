@@ -169,32 +169,17 @@ public sealed class ApiService : IDisposable
                     client,
                     () =>
                     {
-                        var request = new RestRequest(captureEndpoint, Method.Post)
-                        {
-                            AlwaysMultipartFormData = true
-                        };
+                        var payload = BuildCapturePayload(
+                            ticketId,
+                            gateId,
+                            capturedAt,
+                            capturedAtInstant,
+                            snapshots,
+                            additionalPayload);
 
-                        request.AddParameter("ticketId", ticketId);
-                        request.AddParameter("gateId", gateId);
-                        request.AddParameter("capturedAt", capturedAt);
-
-                        if (additionalPayload is not null && additionalPayload.Count > 0)
-                        {
-                            var metadataJson = JsonSerializer.Serialize(additionalPayload, JsonOptions);
-                            request.AddParameter("metadata", metadataJson);
-                        }
-
-                        foreach (var (cameraName, bytes) in snapshots)
-                        {
-                            if (bytes is null || bytes.Length == 0)
-                            {
-                                continue;
-                            }
-
-                            var fileName = $"{cameraName}-{capturedAtInstant:yyyyMMddHHmmss}.jpg";
-                            request.AddFile("captures", bytes, fileName, "image/jpeg");
-                        }
-
+                        var request = new RestRequest(captureEndpoint, Method.Post);
+                        var body = JsonSerializer.Serialize(payload, JsonOptions);
+                        request.AddStringBody(body, DataFormat.Json);
                         return request;
                     },
                     cancellationToken)
@@ -222,6 +207,139 @@ public sealed class ApiService : IDisposable
             _logger.Error(ex, "Exception while sending capture");
             return false;
         }
+    }
+
+    private static IDictionary<string, object?> BuildCapturePayload(
+        string ticketId,
+        string gateId,
+        string capturedAt,
+        DateTime capturedAtInstant,
+        IDictionary<string, byte[]> snapshots,
+        IDictionary<string, string>? additionalPayload)
+    {
+        var parameters = new List<Dictionary<string, string?>>();
+
+        var header = BuildCaptureHeader(ticketId, gateId, capturedAt, additionalPayload);
+        if (header.Count > 0)
+        {
+            parameters.Add(header);
+        }
+
+        foreach (var (cameraName, bytes) in snapshots)
+        {
+            if (bytes is null || bytes.Length == 0)
+            {
+                continue;
+            }
+
+            var detail = BuildCaptureDetailEntry(cameraName, bytes, capturedAtInstant, header, additionalPayload);
+            parameters.Add(detail);
+        }
+
+        var metadata = BuildCaptureMetadata(ticketId, gateId, capturedAt, additionalPayload);
+
+        return new Dictionary<string, object?>
+        {
+            ["timestamp"] = capturedAt,
+            ["param"] = parameters,
+            ["opt"] = metadata
+        };
+    }
+
+    private static Dictionary<string, string?> BuildCaptureHeader(
+        string ticketId,
+        string gateId,
+        string capturedAt,
+        IDictionary<string, string>? additionalPayload)
+    {
+        var header = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["INS_UPT"] = GetValue(additionalPayload, "INS_UPT") ?? "INS",
+            ["FSC"] = GetValue(additionalPayload, "FSC") ?? string.Empty,
+            ["RECTYPE"] = GetValue(additionalPayload, "RECTYPE") ?? string.Empty,
+            ["DEPOT"] = GetValue(additionalPayload, "DEPOT") ?? string.Empty,
+            ["REFF_NO"] = GetValue(additionalPayload, "REFF_NO") ?? ticketId,
+            ["TICKET_ID"] = ticketId,
+            ["GATE_ID"] = gateId,
+            ["CAPTURED_AT"] = capturedAt
+        };
+
+        return header;
+    }
+
+    private static Dictionary<string, string?> BuildCaptureDetailEntry(
+        string cameraName,
+        byte[] bytes,
+        DateTime capturedAtInstant,
+        IDictionary<string, string?> header,
+        IDictionary<string, string>? additionalPayload)
+    {
+        var fileName = $"{cameraName}-{capturedAtInstant:yyyyMMddHHmmss}.jpg";
+
+        header.TryGetValue("FSC", out var fsc);
+        header.TryGetValue("RECTYPE", out var rectype);
+        header.TryGetValue("DEPOT", out var depot);
+        header.TryGetValue("REFF_NO", out var referenceNo);
+
+        var detail = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["INS_UPT"] = GetValue(additionalPayload, "INS_UPT_DETAIL") ?? "DTL",
+            ["FSC"] = fsc ?? string.Empty,
+            ["RECTYPE"] = rectype ?? string.Empty,
+            ["DEPOT"] = depot ?? string.Empty,
+            ["REFF_NO"] = referenceNo ?? string.Empty,
+            ["FILE_NAME"] = fileName,
+            ["FILE"] = Convert.ToBase64String(bytes)
+        };
+
+        return detail;
+    }
+
+    private static string BuildCaptureMetadata(
+        string ticketId,
+        string gateId,
+        string capturedAt,
+        IDictionary<string, string>? additionalPayload)
+    {
+        var metadata = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["ticketId"] = ticketId,
+            ["gateId"] = gateId,
+            ["capturedAt"] = capturedAt
+        };
+
+        if (additionalPayload is not null)
+        {
+            foreach (var kvp in additionalPayload)
+            {
+                if (!metadata.ContainsKey(kvp.Key))
+                {
+                    metadata[kvp.Key] = kvp.Value;
+                }
+            }
+        }
+
+        return metadata.Count > 0
+            ? JsonSerializer.Serialize(metadata, JsonOptions)
+            : string.Empty;
+    }
+
+    private static string? GetValue(IDictionary<string, string>? source, string key)
+    {
+        if (source is null)
+        {
+            return null;
+        }
+
+        foreach (var kvp in source)
+        {
+            if (string.Equals(kvp.Key, key, StringComparison.OrdinalIgnoreCase))
+            {
+                return kvp.Value;
+            }
+        }
+
+        return null;
     }
 
     public void Dispose()
