@@ -52,8 +52,12 @@ public sealed class CameraService : IDisposable
     public Task StartStreamingAsync(CancellationToken cancellationToken)
     {
         EnsureInitialized();
-        var tasks = _sessions.Select(session => session.StartAsync(cancellationToken));
-        return Task.WhenAll(tasks);
+        foreach (var session in _sessions)
+        {
+            session.StartAsync(cancellationToken);
+        }
+
+        return Task.CompletedTask;
     }
 
     public async Task<IDictionary<string, byte[]>> CaptureSnapshotsAsync(CancellationToken cancellationToken)
@@ -75,6 +79,40 @@ public sealed class CameraService : IDisposable
         {
             session.Stop();
         }
+    }
+
+    public int CameraCount
+    {
+        get
+        {
+            EnsureInitialized();
+            return _sessions.Count;
+        }
+    }
+
+    public string GetCameraName(int index)
+    {
+        EnsureInitialized();
+        return _sessions[index].Name;
+    }
+
+    public bool IsCameraStreaming(int index)
+    {
+        EnsureInitialized();
+        return _sessions[index].IsStreaming;
+    }
+
+    public Task StartCameraAsync(int index, CancellationToken cancellationToken)
+    {
+        EnsureInitialized();
+        _sessions[index].StartAsync(cancellationToken);
+        return Task.CompletedTask;
+    }
+
+    public void StopCamera(int index)
+    {
+        EnsureInitialized();
+        _sessions[index].Stop();
     }
 
     private void EnsureInitialized()
@@ -107,9 +145,11 @@ public sealed class CameraService : IDisposable
         private readonly PictureBox _pictureBox;
         private readonly ILogger _logger;
         private readonly object _frameLock = new();
+        private readonly object _stateLock = new();
         private CancellationTokenSource? _cts;
         private Task? _streamingTask;
         private Mat? _latestFrame;
+        private bool _isStreaming;
         private bool _disposed;
 
         public CameraSession(CameraConfiguration configuration, PictureBox pictureBox, ILogger logger)
@@ -121,61 +161,81 @@ public sealed class CameraService : IDisposable
 
         public string Name => _configuration.Name;
 
-        public Task StartAsync(CancellationToken externalToken)
+        public bool IsStreaming
         {
-            if (_streamingTask is not null)
+            get
             {
-                return _streamingTask;
+                lock (_stateLock)
+                {
+                    return _isStreaming;
+                }
             }
+        }
 
-            _cts = CancellationTokenSource.CreateLinkedTokenSource(externalToken);
-            var token = _cts.Token;
+        public void StartAsync(CancellationToken externalToken)
+        {
+            lock (_stateLock)
+            {
+                if (_isStreaming)
+                {
+                    return;
+                }
 
-            _streamingTask = Task.Run(() => StreamAsync(token), token);
-            return _streamingTask;
+                _cts = CancellationTokenSource.CreateLinkedTokenSource(externalToken);
+                var token = _cts.Token;
+
+                _streamingTask = Task.Run(() => StreamAsync(token), CancellationToken.None);
+                _isStreaming = true;
+            }
         }
 
         private async Task StreamAsync(CancellationToken cancellationToken)
         {
             _logger.Information("Starting stream for camera {Camera}", _configuration.Name);
-            while (!cancellationToken.IsCancellationRequested)
+            try
             {
-                try
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    using var capture = new VideoCapture(_configuration.Rtsp);
-                    if (!capture.IsOpened())
+                    try
                     {
-                        _logger.Warning("Unable to open stream for camera {Camera}", _configuration.Name);
-                        await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
-                        continue;
-                    }
-
-                    using var frame = new Mat();
-                    while (!cancellationToken.IsCancellationRequested)
-                    {
-                        if (!capture.Read(frame) || frame.Empty())
+                        using var capture = new VideoCapture(_configuration.Rtsp);
+                        if (!capture.IsOpened())
                         {
-                            await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                            _logger.Warning("Unable to open stream for camera {Camera}", _configuration.Name);
+                            await Task.Delay(TimeSpan.FromSeconds(5), cancellationToken).ConfigureAwait(false);
                             continue;
                         }
 
-                        UpdateLatestFrame(frame);
-                        UpdatePictureBox(frame);
-                        await Task.Delay(75, cancellationToken).ConfigureAwait(false);
+                        using var frame = new Mat();
+                        while (!cancellationToken.IsCancellationRequested)
+                        {
+                            if (!capture.Read(frame) || frame.Empty())
+                            {
+                                await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                                continue;
+                            }
+
+                            UpdateLatestFrame(frame);
+                            UpdatePictureBox(frame);
+                            await Task.Delay(75, cancellationToken).ConfigureAwait(false);
+                        }
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger.Error(ex, "Streaming error for camera {Camera}", _configuration.Name);
+                        await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
                     }
                 }
-                catch (OperationCanceledException)
-                {
-                    break;
-                }
-                catch (Exception ex)
-                {
-                    _logger.Error(ex, "Streaming error for camera {Camera}", _configuration.Name);
-                    await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
-                }
             }
-
-            _logger.Information("Stopped stream for camera {Camera}", _configuration.Name);
+            finally
+            {
+                _logger.Information("Stopped stream for camera {Camera}", _configuration.Name);
+                CleanupStreamingState();
+            }
         }
 
         private void UpdateLatestFrame(Mat frame)
@@ -243,15 +303,32 @@ public sealed class CameraService : IDisposable
 
         public void Stop()
         {
-            if (_cts is null)
+            CancellationTokenSource? cts;
+            Task? streamingTask;
+
+            lock (_stateLock)
+            {
+                cts = _cts;
+                streamingTask = _streamingTask;
+            }
+
+            if (cts is null)
             {
                 return;
             }
 
-            _cts.Cancel();
             try
             {
-                _streamingTask?.Wait(TimeSpan.FromSeconds(2));
+                cts.Cancel();
+            }
+            catch (ObjectDisposedException)
+            {
+                // Already cleaned up.
+            }
+
+            try
+            {
+                streamingTask?.Wait(TimeSpan.FromSeconds(2));
             }
             catch (AggregateException ex)
             {
@@ -267,7 +344,6 @@ public sealed class CameraService : IDisposable
             }
 
             Stop();
-            _cts?.Dispose();
             lock (_frameLock)
             {
                 _latestFrame?.Dispose();
@@ -275,6 +351,17 @@ public sealed class CameraService : IDisposable
             }
 
             _disposed = true;
+        }
+
+        private void CleanupStreamingState()
+        {
+            lock (_stateLock)
+            {
+                _streamingTask = null;
+                _cts?.Dispose();
+                _cts = null;
+                _isStreaming = false;
+            }
         }
     }
 }
