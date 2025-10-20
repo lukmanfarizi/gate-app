@@ -29,6 +29,9 @@ public sealed class ApiSettings
     public string GateOutEndpoint { get; init; } = string.Empty;
     public string CaptureEndpoint { get; init; } = string.Empty;
     public string ApiKey { get; init; } = string.Empty;
+    public string LoginEndpoint { get; init; } = string.Empty;
+    public string LoginEmail { get; init; } = string.Empty;
+    public string LoginPassword { get; init; } = string.Empty;
     public TimeSpan Timeout { get; init; } = TimeSpan.FromSeconds(15);
     public int RetryCount { get; init; } = 3;
     public double RetryBackoffSeconds { get; init; } = 1.0;
