@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Text.Json;
@@ -74,9 +75,13 @@ public sealed class ApiService : IDisposable
                     client,
                     () =>
                     {
-                        var payload = JsonSerializer.Serialize(request, JsonOptions);
+                        var payload = IsDssClient(client)
+                            ? BuildDssValidatePayload(client, request)
+                            : (object)request;
+
                         var restRequest = new RestRequest(endpointUri, Method.Post);
-                        restRequest.AddStringBody(payload, DataFormat.Json);
+                        var body = JsonSerializer.Serialize(payload, JsonOptions);
+                        restRequest.AddStringBody(body, DataFormat.Json);
                         return restRequest;
                     },
                     cancellationToken)
@@ -116,6 +121,11 @@ public sealed class ApiService : IDisposable
 
             try
             {
+                if (IsDssClient(client))
+                {
+                    return ParseDssValidateResponse(response.Content);
+                }
+
                 var payload = JsonSerializer.Deserialize<ValidateResponse>(response.Content, JsonOptions);
                 return payload ?? new ValidateResponse
                 {
@@ -123,7 +133,7 @@ public sealed class ApiService : IDisposable
                     Message = "Empty response received from server."
                 };
             }
-            catch (JsonException ex)
+            catch (Exception ex) when (ex is JsonException or InvalidOperationException)
             {
                 _logger.Error(ex, "Failed to parse validate response for {ApiName}.", client.Name);
                 return new ValidateResponse
@@ -340,6 +350,247 @@ public sealed class ApiService : IDisposable
         }
 
         return null;
+    }
+
+    private static bool IsDssClient(ApiClientContext client)
+    {
+        return string.Equals(client.Name, "Dss", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private object BuildDssValidatePayload(ApiClientContext client, ValidateRequest request)
+    {
+        var token = client.GetToken();
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            throw new InvalidOperationException("Authorization token is not available for DSS API requests.");
+        }
+
+        var depotId = TryExtractDepotId(request.QrCode);
+        if (string.IsNullOrWhiteSpace(depotId))
+        {
+            depotId = string.IsNullOrWhiteSpace(client.Settings.DepotId) ? null : client.Settings.DepotId;
+        }
+
+        if (string.IsNullOrWhiteSpace(depotId))
+        {
+            throw new InvalidOperationException("Depot ID could not be determined for DSS API requests.");
+        }
+
+        var parameters = new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["QRCODE"] = request.QrCode,
+            ["DEPOTID"] = depotId,
+            ["TOKEN"] = token
+        };
+
+        return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["param"] = new[] { parameters }
+        };
+    }
+
+    private static string? TryExtractDepotId(string qrCode)
+    {
+        if (string.IsNullOrWhiteSpace(qrCode))
+        {
+            return null;
+        }
+
+        var separatorIndex = qrCode.IndexOf('/');
+        if (separatorIndex <= 0)
+        {
+            return null;
+        }
+
+        var depotId = qrCode[..separatorIndex].Trim();
+        return depotId.Length == 0 ? null : depotId;
+    }
+
+    private ValidateResponse ParseDssValidateResponse(string content)
+    {
+        using var document = JsonDocument.Parse(content);
+        var root = document.RootElement;
+
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("Unexpected DSS response format.");
+        }
+
+        var statusText = TryGetStringCaseInsensitive(root, "status");
+        var success = IsSuccessfulStatus(statusText);
+        var message = TryGetStringCaseInsensitive(root, "msg") ?? string.Empty;
+
+        Dictionary<string, string>? additionalData = null;
+        string? ticketId = null;
+        string? plateNumber = null;
+        string? driverName = null;
+
+        if (TryGetPropertyCaseInsensitive(root, "data", out var dataElement) && dataElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var entry in dataElement.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                additionalData ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var property in entry.EnumerateObject())
+                {
+                    var value = ConvertJsonValueToString(property.Value);
+                    if (value is null)
+                    {
+                        continue;
+                    }
+
+                    additionalData[property.Name] = value;
+
+                    var upperName = property.Name.ToUpperInvariant();
+                    switch (upperName)
+                    {
+                        case "TICKET_ID":
+                        case "TICKETID":
+                        case "REFF_NO":
+                        case "REFFNO":
+                            ticketId ??= value;
+                            break;
+                        case "NOPOL":
+                        case "PLATE_NO":
+                        case "PLATENO":
+                        case "PLATE":
+                            plateNumber ??= value;
+                            break;
+                        case "DRIVER":
+                        case "DRIVER_NAME":
+                            driverName ??= value;
+                            break;
+                        case "MESSAGE":
+                            if (string.IsNullOrWhiteSpace(message))
+                            {
+                                message = value;
+                            }
+
+                            break;
+                    }
+                }
+
+                break;
+            }
+        }
+
+        if (!success && string.IsNullOrWhiteSpace(message) && additionalData is not null &&
+            additionalData.TryGetValue("MESSAGE", out var detailMessage) && !string.IsNullOrWhiteSpace(detailMessage))
+        {
+            message = detailMessage;
+        }
+
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            message = success ? "Validation successful." : "Validation request was not successful.";
+        }
+
+        if (additionalData is not null && additionalData.Count == 0)
+        {
+            additionalData = null;
+        }
+
+        return new ValidateResponse
+        {
+            Success = success,
+            Message = message,
+            TicketId = ticketId,
+            PlateNumber = plateNumber,
+            DriverName = driverName,
+            AdditionalData = additionalData
+        };
+    }
+
+    private static bool TryGetPropertyCaseInsensitive(JsonElement element, string propertyName, out JsonElement value)
+    {
+        foreach (var property in element.EnumerateObject())
+        {
+            if (string.Equals(property.Name, propertyName, StringComparison.OrdinalIgnoreCase))
+            {
+                value = property.Value;
+                return true;
+            }
+        }
+
+        value = default;
+        return false;
+    }
+
+    private static string? TryGetStringCaseInsensitive(JsonElement element, string propertyName)
+    {
+        return TryGetPropertyCaseInsensitive(element, propertyName, out var value)
+            ? ConvertJsonValueToString(value)
+            : null;
+    }
+
+    private static string? ConvertJsonValueToString(JsonElement element)
+    {
+        return element.ValueKind switch
+        {
+            JsonValueKind.Null => null,
+            JsonValueKind.String => element.GetString(),
+            JsonValueKind.Number => element.GetRawText(),
+            JsonValueKind.True => bool.TrueString,
+            JsonValueKind.False => bool.FalseString,
+            _ => element.GetRawText()
+        };
+    }
+
+    private static bool IsSuccessfulStatus(string? statusText)
+    {
+        if (string.IsNullOrWhiteSpace(statusText))
+        {
+            return false;
+        }
+
+        statusText = statusText.Trim();
+
+        if (int.TryParse(statusText, NumberStyles.Integer, CultureInfo.InvariantCulture, out var statusCode))
+        {
+            return statusCode == 1 || statusCode == 200;
+        }
+
+        if (bool.TryParse(statusText, out var boolStatus))
+        {
+            return boolStatus;
+        }
+
+        return string.Equals(statusText, "OK", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(statusText, "SUCCESS", StringComparison.OrdinalIgnoreCase) ||
+               string.Equals(statusText, "S", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static Dictionary<string, string?> BuildLoginParameters(ApiSettings settings)
+    {
+        var credentials = new Dictionary<string, string?>(StringComparer.Ordinal);
+
+        if (!string.IsNullOrWhiteSpace(settings.LoginEmail))
+        {
+            credentials["EMAIL"] = settings.LoginEmail;
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.LoginUsername))
+        {
+            credentials["Username"] = settings.LoginUsername;
+        }
+
+        if (!string.IsNullOrWhiteSpace(settings.LoginPassword))
+        {
+            credentials["PASSWORD"] = settings.LoginPassword;
+            credentials["Password"] = settings.LoginPassword;
+        }
+
+        if (credentials.Count == 0)
+        {
+            throw new InvalidOperationException("Login credentials are not configured.");
+        }
+
+        return credentials;
     }
 
     public void Dispose()
@@ -587,7 +838,7 @@ public sealed class ApiService : IDisposable
 
         if (client.HasLoginConfiguration && !client.CanRefreshToken)
         {
-            throw new InvalidOperationException($"Login credentials are not fully configured for API '{client.Name}'.");
+            throw new InvalidOperationException($"Login credentials are not fully configured for API '{client.Name}'. Username or email along with a password is required.");
         }
 
         if (!string.IsNullOrWhiteSpace(client.Settings.ApiKey) && !client.HasValidToken)
@@ -608,11 +859,7 @@ public sealed class ApiService : IDisposable
         {
             ["param"] = new[]
             {
-                new Dictionary<string, string?>
-                {
-                    ["EMAIL"] = client.Settings.LoginEmail,
-                    ["PASSWORD"] = client.Settings.LoginPassword
-                }
+                BuildLoginParameters(client.Settings)
             }
         };
 
@@ -643,21 +890,22 @@ public sealed class ApiService : IDisposable
         }
 
         using var document = JsonDocument.Parse(response.Content);
+        var root = document.RootElement;
 
-        if (!document.RootElement.TryGetProperty("status", out var statusElement) || statusElement.GetString() != "1")
+        if (!TryGetPropertyCaseInsensitive(root, "status", out var statusElement) ||
+            !IsSuccessfulStatus(ConvertJsonValueToString(statusElement)))
         {
-            var message = document.RootElement.TryGetProperty("msg", out var msgElement)
-                ? msgElement.GetString() ?? "Unknown error"
-                : "Unknown error";
+            var message = TryGetStringCaseInsensitive(root, "msg") ?? "Unknown error";
             throw new InvalidOperationException($"Login request was not successful for API '{client.Name}': {message}");
         }
 
         string? token = null;
-        if (document.RootElement.TryGetProperty("data", out var dataElement) && dataElement.ValueKind == JsonValueKind.Array)
+        if (TryGetPropertyCaseInsensitive(root, "data", out var dataElement) && dataElement.ValueKind == JsonValueKind.Array)
         {
             foreach (var entry in dataElement.EnumerateArray())
             {
-                if (entry.ValueKind == JsonValueKind.Object && entry.TryGetProperty("TOKEN", out var tokenElement))
+                if (entry.ValueKind == JsonValueKind.Object &&
+                    TryGetPropertyCaseInsensitive(entry, "TOKEN", out var tokenElement))
                 {
                     token = tokenElement.GetString();
                     if (!string.IsNullOrWhiteSpace(token))
@@ -758,7 +1006,10 @@ public sealed class ApiService : IDisposable
         public RestClient RestClient { get; }
         public AsyncPolicy<RestResponse> RetryPolicy { get; }
         public bool HasLoginConfiguration => !string.IsNullOrWhiteSpace(Settings.LoginEndpoint);
-        public bool CanRefreshToken => HasLoginConfiguration && !string.IsNullOrWhiteSpace(Settings.LoginEmail) && !string.IsNullOrWhiteSpace(Settings.LoginPassword);
+        public bool CanRefreshToken => HasLoginConfiguration &&
+                                       !string.IsNullOrWhiteSpace(Settings.LoginPassword) &&
+                                       (!string.IsNullOrWhiteSpace(Settings.LoginEmail) ||
+                                        !string.IsNullOrWhiteSpace(Settings.LoginUsername));
         public bool HasValidToken => !string.IsNullOrWhiteSpace(_token) && (_tokenExpiry is null || _tokenExpiry > DateTimeOffset.UtcNow);
         public SemaphoreSlim TokenSemaphore => _tokenSemaphore;
 
@@ -782,9 +1033,14 @@ public sealed class ApiService : IDisposable
             _tokenExpiry = null;
         }
 
+        public string? GetToken()
+        {
+            return _token;
+        }
+
         public void ApplyAuthorization(RestRequest request)
         {
-            if (string.IsNullOrWhiteSpace(_token))
+            if (!Settings.UseAuthorizationHeader || string.IsNullOrWhiteSpace(_token))
             {
                 return;
             }
