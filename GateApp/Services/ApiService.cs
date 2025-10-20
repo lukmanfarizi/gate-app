@@ -1,20 +1,25 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net.Http.Headers;
-using System.Net.Http.Json;
-using System.Text;
+using System.Net;
 using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
 using GateApp.Models;
 using Microsoft.Extensions.Configuration;
 using Polly;
-using Polly.Retry;
+using RestSharp;
 using Serilog;
 
 namespace GateApp.Services;
 
 public sealed class ApiService : IDisposable
 {
+    private static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.Web)
+    {
+        PropertyNameCaseInsensitive = true
+    };
+
     private readonly ILogger _logger;
     private readonly Dictionary<string, ApiClientContext> _apiClients;
     private readonly string _gateDirection;
@@ -24,11 +29,7 @@ public sealed class ApiService : IDisposable
     {
         _logger = logger;
         _apiClients = new Dictionary<string, ApiClientContext>(StringComparer.OrdinalIgnoreCase);
-        _gateDirection = configuration["Gate:Type"];
-        if (string.IsNullOrWhiteSpace(_gateDirection))
-        {
-            _gateDirection = "IN";
-        }
+        _gateDirection = configuration["Gate:Type"] ?? "IN";
 
         var apisSection = configuration.GetSection("Apis");
         var apiChildren = apisSection.GetChildren().ToList();
@@ -38,12 +39,12 @@ public sealed class ApiService : IDisposable
             foreach (var apiSection in apiChildren)
             {
                 var name = apiSection.Key;
-                var settings = apiSection.Get<ApiSettings>() ?? new ApiSettings();
                 if (string.IsNullOrWhiteSpace(name))
                 {
                     continue;
                 }
 
+                var settings = apiSection.Get<ApiSettings>() ?? new ApiSettings();
                 _apiClients[name] = CreateClientContext(name, settings);
             }
         }
@@ -65,24 +66,72 @@ public sealed class ApiService : IDisposable
         {
             var client = GetApiClientForQrCode(request.QrCode);
             _logger.Information("Sending validate request for QR {QrCode} using {ApiName}", request.QrCode, client.Name);
+
             var endpoint = GetGateEndpoint(client);
             var endpointUri = ResolveEndpoint(client, endpoint);
-            using var response = await client.RetryPolicy
-                .ExecuteAsync(ct => client.HttpClient.PostAsJsonAsync(endpointUri, request, ct), cancellationToken)
+
+            var response = await ExecuteAuthorizedWithRetryAsync(
+                    client,
+                    () =>
+                    {
+                        var payload = JsonSerializer.Serialize(request, JsonOptions);
+                        var restRequest = new RestRequest(endpointUri, Method.Post);
+                        restRequest.AddStringBody(payload, DataFormat.Json);
+                        return restRequest;
+                    },
+                    cancellationToken)
                 .ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
+
+            if (response.ResponseStatus != ResponseStatus.Completed)
             {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                var message = response.ErrorMessage ?? response.ErrorException?.Message ?? "Request was not completed.";
+                _logger.Warning("Validate request failed for {ApiName}: {Message}", client.Name, message);
+                return new ValidateResponse
+                {
+                    Success = false,
+                    Message = message
+                };
+            }
+
+            if (!response.IsSuccessful)
+            {
+                var error = GetResponseErrorMessage(response);
                 _logger.Warning("Validate failed with status {Status}: {Message}", response.StatusCode, error);
                 return new ValidateResponse
                 {
                     Success = false,
-                    Message = string.IsNullOrWhiteSpace(error) ? response.ReasonPhrase ?? "Unknown error" : error
+                    Message = error
                 };
             }
 
-            var payload = await response.Content.ReadFromJsonAsync<ValidateResponse>(cancellationToken: cancellationToken).ConfigureAwait(false);
-            return payload;
+            if (string.IsNullOrWhiteSpace(response.Content))
+            {
+                _logger.Warning("Validate response from {ApiName} was empty.", client.Name);
+                return new ValidateResponse
+                {
+                    Success = false,
+                    Message = "Empty response received from server."
+                };
+            }
+
+            try
+            {
+                var payload = JsonSerializer.Deserialize<ValidateResponse>(response.Content, JsonOptions);
+                return payload ?? new ValidateResponse
+                {
+                    Success = false,
+                    Message = "Empty response received from server."
+                };
+            }
+            catch (JsonException ex)
+            {
+                _logger.Error(ex, "Failed to parse validate response for {ApiName}.", client.Name);
+                return new ValidateResponse
+                {
+                    Success = false,
+                    Message = "Invalid response format received from server."
+                };
+            }
         }
         catch (Exception ex)
         {
@@ -108,29 +157,59 @@ public sealed class ApiService : IDisposable
             var client = GetApiClientForQrCode(qrCode);
             var capturedAtInstant = DateTime.UtcNow;
             var capturedAt = capturedAtInstant.ToString("O");
-            using var response = await client.RetryPolicy
-                .ExecuteAsync(async ct =>
-                {
-                    if (string.IsNullOrWhiteSpace(client.Settings.CaptureEndpoint))
-                    {
-                        throw new InvalidOperationException($"Capture endpoint is not configured for API '{client.Name}'.");
-                    }
 
-                    var endpointUri = ResolveEndpoint(client, client.Settings.CaptureEndpoint);
-                    var content = BuildCaptureForm(ticketId, gateId, capturedAt, capturedAtInstant, snapshots, additionalPayload);
-                    try
-                    {
-                        return await client.HttpClient.PostAsync(endpointUri, content, ct).ConfigureAwait(false);
-                    }
-                    finally
-                    {
-                        content.Dispose();
-                    }
-                }, cancellationToken)
-                .ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
+            if (string.IsNullOrWhiteSpace(client.Settings.CaptureEndpoint))
             {
-                var error = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
+                throw new InvalidOperationException($"Capture endpoint is not configured for API '{client.Name}'.");
+            }
+
+            var captureEndpoint = ResolveEndpoint(client, client.Settings.CaptureEndpoint);
+
+            var response = await ExecuteAuthorizedWithRetryAsync(
+                    client,
+                    () =>
+                    {
+                        var request = new RestRequest(captureEndpoint, Method.Post)
+                        {
+                            AlwaysMultipartFormData = true
+                        };
+
+                        request.AddParameter("ticketId", ticketId);
+                        request.AddParameter("gateId", gateId);
+                        request.AddParameter("capturedAt", capturedAt);
+
+                        if (additionalPayload is not null && additionalPayload.Count > 0)
+                        {
+                            var metadataJson = JsonSerializer.Serialize(additionalPayload, JsonOptions);
+                            request.AddParameter("metadata", metadataJson);
+                        }
+
+                        foreach (var (cameraName, bytes) in snapshots)
+                        {
+                            if (bytes is null || bytes.Length == 0)
+                            {
+                                continue;
+                            }
+
+                            var fileName = $"{cameraName}-{capturedAtInstant:yyyyMMddHHmmss}.jpg";
+                            request.AddFile("captures", bytes, fileName, "image/jpeg");
+                        }
+
+                        return request;
+                    },
+                    cancellationToken)
+                .ConfigureAwait(false);
+
+            if (response.ResponseStatus != ResponseStatus.Completed)
+            {
+                var message = response.ErrorMessage ?? response.ErrorException?.Message ?? "Request was not completed.";
+                _logger.Warning("Capture upload failed for {ApiName}: {Message}", client.Name, message);
+                return false;
+            }
+
+            if (!response.IsSuccessful)
+            {
+                var error = GetResponseErrorMessage(response);
                 _logger.Warning("Capture upload failed with status {Status}: {Message}", response.StatusCode, error);
                 return false;
             }
@@ -158,40 +237,6 @@ public sealed class ApiService : IDisposable
         }
 
         _disposed = true;
-    }
-
-    private static MultipartFormDataContent BuildCaptureForm(
-        string ticketId,
-        string gateId,
-        string capturedAt,
-        DateTime capturedAtInstant,
-        IDictionary<string, byte[]> snapshots,
-        IDictionary<string, string>? additionalPayload)
-    {
-        var form = new MultipartFormDataContent();
-        form.Add(new StringContent(ticketId), "ticketId");
-        form.Add(new StringContent(gateId), "gateId");
-        form.Add(new StringContent(capturedAt), "capturedAt");
-
-        if (additionalPayload is not null)
-        {
-            var json = JsonSerializer.Serialize(additionalPayload);
-            form.Add(new StringContent(json, Encoding.UTF8, "application/json"), "metadata");
-        }
-
-        foreach (var (cameraName, bytes) in snapshots)
-        {
-            if (bytes.Length == 0)
-            {
-                continue;
-            }
-
-            var imageContent = new ByteArrayContent(bytes);
-            imageContent.Headers.ContentType = new MediaTypeHeaderValue("image/jpeg");
-            form.Add(imageContent, "captures", $"{cameraName}-{capturedAtInstant:yyyyMMddHHmmss}.jpg");
-        }
-
-        return form;
     }
 
     private ApiClientContext GetApiClientForQrCode(string qrCode)
@@ -247,8 +292,7 @@ public sealed class ApiService : IDisposable
 
     private string GetGateEndpoint(ApiClientContext client)
     {
-        var direction = _gateDirection;
-        if (string.Equals(direction, "OUT", StringComparison.OrdinalIgnoreCase))
+        if (string.Equals(_gateDirection, "OUT", StringComparison.OrdinalIgnoreCase))
         {
             if (!string.IsNullOrWhiteSpace(client.Settings.GateOutEndpoint))
             {
@@ -285,12 +329,13 @@ public sealed class ApiService : IDisposable
             return absolute;
         }
 
-        if (client.HttpClient.BaseAddress is null)
+        var baseUrl = client.RestClient.Options.BaseUrl;
+        if (baseUrl is null)
         {
             throw new InvalidOperationException("API BaseUrl must be configured when using relative endpoints.");
         }
 
-        return new Uri(client.HttpClient.BaseAddress, endpoint);
+        return new Uri(baseUrl, endpoint);
     }
 
     private ApiClientContext CreateClientContext(string name, ApiSettings settings)
@@ -300,23 +345,48 @@ public sealed class ApiService : IDisposable
             throw new InvalidOperationException($"API BaseUrl is not configured for '{name}'.");
         }
 
-        var httpClient = new HttpClient
+        var baseUri = new Uri(settings.BaseUrl);
+        var maxTimeout = settings.Timeout <= TimeSpan.Zero
+            ? -1
+            : (int)Math.Min(int.MaxValue, settings.Timeout.TotalMilliseconds);
+
+        var options = new RestClientOptions(baseUri)
         {
-            BaseAddress = new Uri(settings.BaseUrl),
-            Timeout = settings.Timeout
+            ThrowOnAnyError = false,
+            MaxTimeout = maxTimeout
         };
+
+        var restClient = new RestClient(options);
+        var retryPolicy = CreateRetryPolicy(name, settings);
+
+        var context = new ApiClientContext(name, settings, restClient, retryPolicy);
 
         if (!string.IsNullOrWhiteSpace(settings.ApiKey))
         {
-            httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", settings.ApiKey);
+            context.SetToken(settings.ApiKey, null);
         }
 
+        return context;
+    }
+
+    private AsyncPolicy<RestResponse> CreateRetryPolicy(string name, ApiSettings settings)
+    {
         var retryCount = Math.Max(0, settings.RetryCount);
+        if (retryCount == 0)
+        {
+            return Policy.NoOpAsync<RestResponse>();
+        }
+
         var baseDelay = settings.RetryBackoffSeconds <= 0 ? 1 : settings.RetryBackoffSeconds;
-        var retryPolicy = Policy<HttpResponseMessage>
-            .Handle<HttpRequestException>()
+
+        return Policy
+            .Handle<TimeoutException>()
             .Or<TaskCanceledException>()
-            .OrResult(response => (int)response.StatusCode >= 500)
+            .OrResult<RestResponse>(response =>
+                response.ResponseStatus == ResponseStatus.TimedOut ||
+                response.StatusCode == HttpStatusCode.RequestTimeout ||
+                (response.ResponseStatus == ResponseStatus.Error &&
+                 response.ErrorException is TimeoutException or TaskCanceledException))
             .WaitAndRetryAsync(
                 retryCount,
                 attempt => TimeSpan.FromSeconds(baseDelay * Math.Pow(2, attempt - 1)),
@@ -324,35 +394,290 @@ public sealed class ApiService : IDisposable
                 {
                     if (outcome.Exception is not null)
                     {
-                        _logger.Warning(outcome.Exception, "HTTP request failed on attempt {Attempt} for {ApiName}. Retrying in {Delay}.", attempt, name, span);
+                        _logger.Warning(outcome.Exception, "Request timed out on attempt {Attempt} for {ApiName}. Retrying in {Delay}.", attempt, name, span);
                     }
                     else
                     {
-                        _logger.Warning("HTTP request returned status {Status} on attempt {Attempt} for {ApiName}. Retrying in {Delay}.", outcome.Result.StatusCode, attempt, name, span);
+                        _logger.Warning("Request timed out on attempt {Attempt} for {ApiName}. Retrying in {Delay}.", attempt, name, span);
                     }
                 });
-
-        return new ApiClientContext(name, settings, httpClient, retryPolicy);
     }
+
+    private Task<RestResponse> ExecuteAuthorizedWithRetryAsync(ApiClientContext client, Func<RestRequest> requestFactory, CancellationToken cancellationToken)
+    {
+        return client.RetryPolicy.ExecuteAsync(ct => SendAuthorizedAsync(client, requestFactory, ct), cancellationToken);
+    }
+
+    private Task<RestResponse> ExecuteWithoutAuthorizationWithRetryAsync(ApiClientContext client, Func<RestRequest> requestFactory, CancellationToken cancellationToken)
+    {
+        return client.RetryPolicy.ExecuteAsync(ct => client.RestClient.ExecuteAsync(requestFactory(), ct), cancellationToken);
+    }
+
+    private async Task<RestResponse> SendAuthorizedAsync(ApiClientContext client, Func<RestRequest> requestFactory, CancellationToken cancellationToken)
+    {
+        await EnsureAuthorizationAsync(client, cancellationToken).ConfigureAwait(false);
+
+        var response = await ExecuteRequestAsync(client, requestFactory, cancellationToken).ConfigureAwait(false);
+        if (response.StatusCode != HttpStatusCode.Unauthorized || !client.CanRefreshToken)
+        {
+            return response;
+        }
+
+        _logger.Warning("Authorization failed for {ApiName}. Refreshing token and retrying once.", client.Name);
+        client.ClearToken();
+
+        await EnsureAuthorizationAsync(client, cancellationToken).ConfigureAwait(false);
+        return await ExecuteRequestAsync(client, requestFactory, cancellationToken).ConfigureAwait(false);
+    }
+
+    private Task<RestResponse> ExecuteRequestAsync(ApiClientContext client, Func<RestRequest> requestFactory, CancellationToken cancellationToken)
+    {
+        var request = requestFactory();
+        client.ApplyAuthorization(request);
+        return client.RestClient.ExecuteAsync(request, cancellationToken);
+    }
+
+    private async Task EnsureAuthorizationAsync(ApiClientContext client, CancellationToken cancellationToken)
+    {
+        if (client.HasValidToken)
+        {
+            return;
+        }
+
+        if (client.CanRefreshToken)
+        {
+            await client.TokenSemaphore.WaitAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                if (client.HasValidToken)
+                {
+                    return;
+                }
+
+                var token = await AuthenticateAsync(client, cancellationToken).ConfigureAwait(false);
+                client.SetToken(token.Token, token.ExpiresAt);
+                var expiryMessage = token.ExpiresAt?.ToString("O") ?? "unknown";
+                _logger.Information("Obtained bearer token for {ApiName}. Expires at {Expiry}.", client.Name, expiryMessage);
+            }
+            finally
+            {
+                client.TokenSemaphore.Release();
+            }
+
+            return;
+        }
+
+        if (client.HasLoginConfiguration && !client.CanRefreshToken)
+        {
+            throw new InvalidOperationException($"Login credentials are not fully configured for API '{client.Name}'.");
+        }
+
+        if (!string.IsNullOrWhiteSpace(client.Settings.ApiKey) && !client.HasValidToken)
+        {
+            client.SetToken(client.Settings.ApiKey, null);
+        }
+    }
+
+    private async Task<AuthToken> AuthenticateAsync(ApiClientContext client, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(client.Settings.LoginEndpoint))
+        {
+            throw new InvalidOperationException($"Login endpoint is not configured for API '{client.Name}'.");
+        }
+
+        var endpointUri = ResolveEndpoint(client, client.Settings.LoginEndpoint);
+        var payload = new Dictionary<string, object?>
+        {
+            ["param"] = new[]
+            {
+                new Dictionary<string, string?>
+                {
+                    ["EMAIL"] = client.Settings.LoginEmail,
+                    ["PASSWORD"] = client.Settings.LoginPassword
+                }
+            }
+        };
+
+        _logger.Information("Requesting bearer token for {ApiName}.", client.Name);
+
+        var response = await ExecuteWithoutAuthorizationWithRetryAsync(
+                client,
+                () =>
+                {
+                    var request = new RestRequest(endpointUri, Method.Post);
+                    var body = JsonSerializer.Serialize(payload);
+                    request.AddStringBody(body, DataFormat.Json);
+                    return request;
+                },
+                cancellationToken)
+            .ConfigureAwait(false);
+
+        if (response.ResponseStatus != ResponseStatus.Completed)
+        {
+            var message = response.ErrorMessage ?? response.ErrorException?.Message ?? "Request was not completed.";
+            throw new InvalidOperationException($"Login request failed for API '{client.Name}': {message}");
+        }
+
+        if (!response.IsSuccessful || string.IsNullOrWhiteSpace(response.Content))
+        {
+            var message = GetResponseErrorMessage(response);
+            throw new InvalidOperationException($"Login request failed for API '{client.Name}' with status {response.StatusCode}: {message}");
+        }
+
+        using var document = JsonDocument.Parse(response.Content);
+
+        if (!document.RootElement.TryGetProperty("status", out var statusElement) || statusElement.GetString() != "1")
+        {
+            var message = document.RootElement.TryGetProperty("msg", out var msgElement)
+                ? msgElement.GetString() ?? "Unknown error"
+                : "Unknown error";
+            throw new InvalidOperationException($"Login request was not successful for API '{client.Name}': {message}");
+        }
+
+        string? token = null;
+        if (document.RootElement.TryGetProperty("data", out var dataElement) && dataElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var entry in dataElement.EnumerateArray())
+            {
+                if (entry.ValueKind == JsonValueKind.Object && entry.TryGetProperty("TOKEN", out var tokenElement))
+                {
+                    token = tokenElement.GetString();
+                    if (!string.IsNullOrWhiteSpace(token))
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(token))
+        {
+            throw new InvalidOperationException($"Login response did not contain a bearer token for API '{client.Name}'.");
+        }
+
+        var expiresAt = TryDecodeJwtExpiry(token);
+        return new AuthToken(token, expiresAt);
+    }
+
+    private static DateTimeOffset? TryDecodeJwtExpiry(string token)
+    {
+        var parts = token.Split('.');
+        if (parts.Length < 2)
+        {
+            return null;
+        }
+
+        try
+        {
+            var payload = parts[1]
+                .Replace('-', '+')
+                .Replace('_', '/');
+
+            switch (payload.Length % 4)
+            {
+                case 2:
+                    payload += "==";
+                    break;
+                case 3:
+                    payload += "=";
+                    break;
+            }
+
+            var bytes = Convert.FromBase64String(payload);
+            using var document = JsonDocument.Parse(bytes);
+            if (document.RootElement.TryGetProperty("exp", out var expElement) && expElement.TryGetInt64(out var expSeconds))
+            {
+                return DateTimeOffset.FromUnixTimeSeconds(expSeconds);
+            }
+        }
+        catch
+        {
+            return null;
+        }
+
+        return null;
+    }
+
+    private static string GetResponseErrorMessage(RestResponse response)
+    {
+        if (!string.IsNullOrWhiteSpace(response.Content))
+        {
+            return response.Content;
+        }
+
+        if (!string.IsNullOrWhiteSpace(response.ErrorMessage))
+        {
+            return response.ErrorMessage;
+        }
+
+        if (response.ErrorException is not null)
+        {
+            return response.ErrorException.Message;
+        }
+
+        return response.StatusDescription ?? "Unknown error";
+    }
+
+    private readonly record struct AuthToken(string Token, DateTimeOffset? ExpiresAt);
 
     private sealed class ApiClientContext : IDisposable
     {
-        public ApiClientContext(string name, ApiSettings settings, HttpClient httpClient, AsyncRetryPolicy<HttpResponseMessage> retryPolicy)
+        private static readonly TimeSpan TokenRefreshBuffer = TimeSpan.FromMinutes(1);
+        private readonly SemaphoreSlim _tokenSemaphore = new(1, 1);
+        private string? _token;
+        private DateTimeOffset? _tokenExpiry;
+
+        public ApiClientContext(string name, ApiSettings settings, RestClient restClient, AsyncPolicy<RestResponse> retryPolicy)
         {
             Name = name;
             Settings = settings;
-            HttpClient = httpClient;
+            RestClient = restClient;
             RetryPolicy = retryPolicy;
         }
 
         public string Name { get; }
         public ApiSettings Settings { get; }
-        public HttpClient HttpClient { get; }
-        public AsyncRetryPolicy<HttpResponseMessage> RetryPolicy { get; }
+        public RestClient RestClient { get; }
+        public AsyncPolicy<RestResponse> RetryPolicy { get; }
+        public bool HasLoginConfiguration => !string.IsNullOrWhiteSpace(Settings.LoginEndpoint);
+        public bool CanRefreshToken => HasLoginConfiguration && !string.IsNullOrWhiteSpace(Settings.LoginEmail) && !string.IsNullOrWhiteSpace(Settings.LoginPassword);
+        public bool HasValidToken => !string.IsNullOrWhiteSpace(_token) && (_tokenExpiry is null || _tokenExpiry > DateTimeOffset.UtcNow);
+        public SemaphoreSlim TokenSemaphore => _tokenSemaphore;
+
+        public void SetToken(string token, DateTimeOffset? expiresAt)
+        {
+            _token = token;
+            if (expiresAt is null)
+            {
+                _tokenExpiry = null;
+            }
+            else
+            {
+                var refreshTime = expiresAt.Value - TokenRefreshBuffer;
+                _tokenExpiry = refreshTime > DateTimeOffset.UtcNow ? refreshTime : expiresAt.Value;
+            }
+        }
+
+        public void ClearToken()
+        {
+            _token = null;
+            _tokenExpiry = null;
+        }
+
+        public void ApplyAuthorization(RestRequest request)
+        {
+            if (string.IsNullOrWhiteSpace(_token))
+            {
+                return;
+            }
+
+            request.AddOrUpdateHeader("Authorization", $"Bearer {_token}");
+        }
 
         public void Dispose()
         {
-            HttpClient.Dispose();
+            RestClient.Dispose();
+            _tokenSemaphore.Dispose();
         }
     }
 }
