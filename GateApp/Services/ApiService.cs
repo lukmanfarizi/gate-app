@@ -128,6 +128,11 @@ public sealed class ApiService : IDisposable
                     return ParseDssValidateResponse(response.Content);
                 }
 
+                if (IsMadosClient(client))
+                {
+                    return ParseMadosValidateResponse(response.Content);
+                }
+
                 var payload = JsonSerializer.Deserialize<ValidateResponse>(response.Content, JsonOptions);
                 return payload ?? new ValidateResponse
                 {
@@ -521,6 +526,128 @@ public sealed class ApiService : IDisposable
             additionalData.TryGetValue("MESSAGE", out var detailMessage) && !string.IsNullOrWhiteSpace(detailMessage))
         {
             message = detailMessage;
+        }
+
+        if (string.IsNullOrWhiteSpace(message))
+        {
+            message = success ? "Validation successful." : "Validation request was not successful.";
+        }
+
+        if (additionalData is not null && additionalData.Count == 0)
+        {
+            additionalData = null;
+        }
+
+        return new ValidateResponse
+        {
+            Success = success,
+            Message = message,
+            TicketId = ticketId,
+            PlateNumber = plateNumber,
+            DriverName = driverName,
+            AdditionalData = additionalData
+        };
+    }
+
+    private ValidateResponse ParseMadosValidateResponse(string content)
+    {
+        using var document = JsonDocument.Parse(content);
+        var root = document.RootElement;
+
+        if (root.ValueKind != JsonValueKind.Object)
+        {
+            throw new InvalidOperationException("Unexpected MADOS response format.");
+        }
+
+        var statusText = TryGetStringCaseInsensitive(root, "status");
+        var success = IsSuccessfulStatus(statusText);
+        var message = TryGetStringCaseInsensitive(root, "msg") ?? string.Empty;
+
+        Dictionary<string, string>? additionalData = null;
+        string? ticketId = null;
+        string? plateNumber = null;
+        string? driverName = null;
+
+        if (TryGetPropertyCaseInsensitive(root, "data", out var dataElement) &&
+            dataElement.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var entry in dataElement.EnumerateArray())
+            {
+                if (entry.ValueKind != JsonValueKind.Object)
+                {
+                    continue;
+                }
+
+                additionalData ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+                foreach (var property in entry.EnumerateObject())
+                {
+                    var value = ConvertJsonValueToString(property.Value);
+                    if (value is null)
+                    {
+                        continue;
+                    }
+
+                    additionalData[property.Name] = value;
+
+                    var upperName = property.Name.ToUpperInvariant();
+                    switch (upperName)
+                    {
+                        case "DWI":
+                        case "EIR":
+                        case "GATEPASS":
+                        case "GATE_PASS":
+                        case "PASS_NUMBER":
+                        case "TICKET_ID":
+                        case "TICKETID":
+                        case "QRCODE":
+                            ticketId ??= value;
+                            break;
+                        case "NOPOL":
+                        case "PLATE_NO":
+                        case "PLATENO":
+                        case "NOPOLIS":
+                        case "PLATE":
+                            plateNumber ??= value;
+                            break;
+                        case "DRIVER":
+                        case "DRIVER_NAME":
+                        case "DRIVERNAME":
+                            driverName ??= value;
+                            break;
+                        case "GATESTATUS":
+                        case "GATE_STATUS":
+                        case "REASON":
+                        case "REMARK":
+                            if (string.IsNullOrWhiteSpace(message))
+                            {
+                                message = value;
+                            }
+
+                            break;
+                    }
+                }
+
+                break;
+            }
+        }
+
+        if (!success && string.IsNullOrWhiteSpace(message) &&
+            TryGetPropertyCaseInsensitive(root, "reason", out var reasonElement))
+        {
+            var reason = ConvertJsonValueToString(reasonElement);
+            if (!string.IsNullOrWhiteSpace(reason))
+            {
+                message = reason;
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(message) &&
+            additionalData is not null &&
+            additionalData.TryGetValue("GATESTATUS", out var gateStatus) &&
+            !string.IsNullOrWhiteSpace(gateStatus))
+        {
+            message = gateStatus;
         }
 
         if (string.IsNullOrWhiteSpace(message))
