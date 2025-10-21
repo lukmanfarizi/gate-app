@@ -77,7 +77,9 @@ public sealed class ApiService : IDisposable
                     {
                         var payload = IsDssClient(client)
                             ? BuildDssValidatePayload(client, request)
-                            : (object)request;
+                            : IsMadosClient(client)
+                                ? BuildMadosValidatePayload(client, request)
+                                : (object)request;
 
                         var restRequest = new RestRequest(endpointUri, Method.Post);
                         var body = JsonSerializer.Serialize(payload, JsonOptions);
@@ -357,6 +359,11 @@ public sealed class ApiService : IDisposable
         return string.Equals(client.Name, "Dss", StringComparison.OrdinalIgnoreCase);
     }
 
+    private static bool IsMadosClient(ApiClientContext client)
+    {
+        return client.Name.EndsWith("Mados", StringComparison.OrdinalIgnoreCase);
+    }
+
     private object BuildDssValidatePayload(ApiClientContext client, ValidateRequest request)
     {
         var token = client.GetToken();
@@ -382,6 +389,37 @@ public sealed class ApiService : IDisposable
             ["DEPOTID"] = depotId,
             ["TOKEN"] = token
         };
+
+        return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["param"] = new[] { parameters }
+        };
+    }
+
+    private object BuildMadosValidatePayload(ApiClientContext client, ValidateRequest request)
+    {
+        var depotId = TryExtractDepotId(request.QrCode);
+        if (string.IsNullOrWhiteSpace(depotId))
+        {
+            depotId = string.IsNullOrWhiteSpace(client.Settings.DepotId) ? null : client.Settings.DepotId;
+        }
+
+        if (string.IsNullOrWhiteSpace(depotId))
+        {
+            throw new InvalidOperationException("Depot ID could not be determined for MADOS API requests.");
+        }
+
+        var parameters = new Dictionary<string, string?>(StringComparer.Ordinal)
+        {
+            ["QRCODE"] = request.QrCode,
+            ["DEPOTID"] = depotId
+        };
+
+        if (string.Equals(_gateDirection, "OUT", StringComparison.OrdinalIgnoreCase) &&
+            !string.IsNullOrWhiteSpace(request.GateId))
+        {
+            parameters["GATE_PASS"] = request.GateId;
+        }
 
         return new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase)
         {
@@ -651,7 +689,8 @@ public sealed class ApiService : IDisposable
             return "DwiMados";
         }
 
-        if (qrCode.Contains("/RC/", StringComparison.OrdinalIgnoreCase))
+        if (qrCode.Contains("/RC/", StringComparison.OrdinalIgnoreCase) ||
+            qrCode.Contains("/DL/", StringComparison.OrdinalIgnoreCase))
         {
             return "EirMados";
         }
