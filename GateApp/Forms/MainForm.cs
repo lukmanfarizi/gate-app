@@ -208,10 +208,25 @@ public partial class MainForm : Form
             };
 
             var validateResponse = await _apiService.ValidateAsync(validateRequest, token).ConfigureAwait(false);
-            if (validateResponse is null || !validateResponse.Success)
+            if (validateResponse is null)
             {
-                var message = validateResponse?.Message ?? "Validation failed";
-                LogMessage($"Validation failed: {message}");
+                LogApiResult(null);
+                await InvokeAsync(() =>
+                {
+                    UpdateStatus(apiStatusLabel, "API: Failed");
+                    UpdateStatus(gateStatusLabel, "Gate: Locked");
+                }).ConfigureAwait(false);
+                SystemSounds.Beep.Play();
+                return;
+            }
+
+            LogApiResult(validateResponse);
+
+            if (!validateResponse.Success)
+            {
+                var message = string.IsNullOrWhiteSpace(validateResponse.Message)
+                    ? "Validation failed"
+                    : validateResponse.Message;
                 await InvokeAsync(() =>
                 {
                     UpdateStatus(apiStatusLabel, "API: Failed");
@@ -304,6 +319,44 @@ public partial class MainForm : Form
             _operationCts = null;
             _processingSemaphore.Release();
             FocusScanner();
+        }
+    }
+
+    private void LogApiResult(ValidateResponse? response)
+    {
+        if (response is null)
+        {
+            LogMessage("API result [Failure]: No response received from API.");
+            return;
+        }
+
+        var statusLabel = response.Success ? "Success" : "Failure";
+        var message = string.IsNullOrWhiteSpace(response.Message) ? "(no message)" : response.Message;
+        LogMessage($"API result [{statusLabel}]: {message}");
+
+        if (!string.IsNullOrWhiteSpace(response.TicketId))
+        {
+            LogMessage($"    Ticket: {response.TicketId}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(response.PlateNumber))
+        {
+            LogMessage($"    Plate: {response.PlateNumber}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(response.DriverName))
+        {
+            LogMessage($"    Driver: {response.DriverName}");
+        }
+
+        if (response.AdditionalData is null)
+        {
+            return;
+        }
+
+        foreach (var item in response.AdditionalData)
+        {
+            LogMessage($"    {item.Key}: {item.Value}");
         }
     }
 
