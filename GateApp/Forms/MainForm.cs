@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Linq;
 using System.Media;
 using System.Threading;
 using System.Threading.Tasks;
@@ -21,6 +22,7 @@ public partial class MainForm : Form
     private readonly ApplicationSettings _settings;
     private readonly CancellationTokenSource _lifetimeCts = new();
     private readonly SemaphoreSlim _processingSemaphore = new(1, 1);
+    private readonly Dictionary<int, Button> _cameraButtons = new();
     private CancellationTokenSource? _operationCts;
 
     public MainForm(IConfiguration configuration,
@@ -47,6 +49,14 @@ public partial class MainForm : Form
     private void InitializeServices()
     {
         _cameraService.Initialize(new[] { pictureBox1, pictureBox2, pictureBox3, pictureBox4 });
+        RegisterCameraButton(cameraToggleButton1, 0);
+        RegisterCameraButton(cameraToggleButton2, 1);
+        RegisterCameraButton(cameraToggleButton3, 2);
+        RegisterCameraButton(cameraToggleButton4, 3);
+        cameraPanel1.MouseDown += ControlOnMouseDown;
+        cameraPanel2.MouseDown += ControlOnMouseDown;
+        cameraPanel3.MouseDown += ControlOnMouseDown;
+        cameraPanel4.MouseDown += ControlOnMouseDown;
         scannerTextBox.KeyDown += ScannerTextBoxOnKeyDown;
         scannerTextBox.GotFocus += ScannerTextBoxOnGotFocus;
         scannerTextBox.LostFocus += ScannerTextBoxOnLostFocus;
@@ -61,15 +71,89 @@ public partial class MainForm : Form
         pictureBox2.MouseDown += ControlOnMouseDown;
         pictureBox3.MouseDown += ControlOnMouseDown;
         pictureBox4.MouseDown += ControlOnMouseDown;
+        UpdateCameraButtons();
+    }
+
+    private void RegisterCameraButton(Button button, int index)
+    {
+        _cameraButtons[index] = button;
+        button.Tag = index;
+        button.Click += CameraToggleButtonOnClick;
+    }
+
+    private void UpdateCameraButtons()
+    {
+        foreach (var (index, button) in _cameraButtons)
+        {
+            button.Text = _cameraService.IsCameraStreaming(index) ? "Stop" : "Start";
+        }
+    }
+
+    private void UpdateCameraStatus()
+    {
+        var total = _cameraService.CameraCount;
+        if (total == 0)
+        {
+            UpdateStatus(cameraStatusLabel, "Cameras: Not Configured");
+            return;
+        }
+
+        var streamingCount = Enumerable.Range(0, total).Count(index => _cameraService.IsCameraStreaming(index));
+        var status = streamingCount switch
+        {
+            0 => "Cameras: Stopped",
+            var n when n == total => "Cameras: Streaming",
+            _ => $"Cameras: {streamingCount}/{total} Streaming"
+        };
+
+        UpdateStatus(cameraStatusLabel, status);
+    }
+
+    private async void CameraToggleButtonOnClick(object? sender, EventArgs e)
+    {
+        if (sender is not Button button || button.Tag is not int index)
+        {
+            return;
+        }
+
+        var cameraName = _cameraService.GetCameraName(index);
+        button.Enabled = false;
+
+        try
+        {
+            if (_cameraService.IsCameraStreaming(index))
+            {
+                _cameraService.StopCamera(index);
+                LogMessage($"Camera {cameraName} stopped.");
+            }
+            else
+            {
+                await _cameraService.StartCameraAsync(index, _lifetimeCts.Token);
+                LogMessage($"Camera {cameraName} started.");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logService.Logger.Error(ex, "Failed to toggle camera {Camera}", cameraName);
+            LogMessage($"Failed to toggle camera {cameraName}: {ex.Message}");
+        }
+        finally
+        {
+            UpdateCameraButtons();
+            UpdateCameraStatus();
+            button.Enabled = true;
+            FocusScanner();
+        }
     }
 
     private void MainForm_Shown(object? sender, EventArgs e)
     {
         FocusScanner();
         _scannerService.Start();
-        _ = Task.Run(async () => await _cameraService.StartStreamingAsync(_lifetimeCts.Token));
+        _cameraService.StartStreamingAsync(_lifetimeCts.Token);
+        UpdateCameraButtons();
         UpdateStatus(apiStatusLabel, "API: Ready");
-        UpdateStatus(cameraStatusLabel, "Cameras: Streaming");
+        UpdateCameraStatus();
         UpdateStatus(gateStatusLabel, "Gate: Ready");
         LogMessage("GateApp ready. Waiting for scans...");
     }
@@ -196,7 +280,8 @@ public partial class MainForm : Form
             await InvokeAsync(() =>
             {
                 UpdateStatus(apiStatusLabel, "API: Ready");
-                UpdateStatus(cameraStatusLabel, "Cameras: Ready");
+                UpdateCameraButtons();
+                UpdateCameraStatus();
                 UpdateStatus(gateStatusLabel, gateOpened ? "Gate: Open" : "Gate: Error");
             }).ConfigureAwait(false);
         }
@@ -207,7 +292,8 @@ public partial class MainForm : Form
             await InvokeAsync(() =>
             {
                 UpdateStatus(apiStatusLabel, "API: Error");
-                UpdateStatus(cameraStatusLabel, "Cameras: Ready");
+                UpdateCameraButtons();
+                UpdateCameraStatus();
                 UpdateStatus(gateStatusLabel, "Gate: Error");
             }).ConfigureAwait(false);
             SystemSounds.Beep.Play();
@@ -290,10 +376,18 @@ public partial class MainForm : Form
         bottomPanel.MouseDown -= ControlOnMouseDown;
         logTextBox.MouseDown -= ControlOnMouseDown;
         statusStrip.MouseDown -= ControlOnMouseDown;
+        cameraPanel1.MouseDown -= ControlOnMouseDown;
+        cameraPanel2.MouseDown -= ControlOnMouseDown;
+        cameraPanel3.MouseDown -= ControlOnMouseDown;
+        cameraPanel4.MouseDown -= ControlOnMouseDown;
         pictureBox1.MouseDown -= ControlOnMouseDown;
         pictureBox2.MouseDown -= ControlOnMouseDown;
         pictureBox3.MouseDown -= ControlOnMouseDown;
         pictureBox4.MouseDown -= ControlOnMouseDown;
+        cameraToggleButton1.Click -= CameraToggleButtonOnClick;
+        cameraToggleButton2.Click -= CameraToggleButtonOnClick;
+        cameraToggleButton3.Click -= CameraToggleButtonOnClick;
+        cameraToggleButton4.Click -= CameraToggleButtonOnClick;
     }
 
     private void ScannerTextBoxOnGotFocus(object? sender, EventArgs e)
