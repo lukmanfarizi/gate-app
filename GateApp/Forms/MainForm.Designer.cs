@@ -295,37 +295,40 @@ partial class MainForm
         logTextBox.Name = "logTextBox";
         logTextBox.ReadOnly = true;
         logTextBox.ScrollBars = ScrollBars.Vertical;
-        logTextBox.Size = new Size(1463, 267);
+        logTextBox.Size = new Size(1463, 262);
         logTextBox.TabIndex = 0;
         // 
         // statusStrip
         // 
         statusStrip.ImageScalingSize = new Size(20, 20);
         statusStrip.Items.AddRange(new ToolStripItem[] { apiStatusLabel, cameraStatusLabel, gateStatusLabel });
-        statusStrip.Location = new Point(0, 267);
+        statusStrip.Location = new Point(0, 262);
         statusStrip.Name = "statusStrip";
         statusStrip.Padding = new Padding(1, 0, 16, 0);
-        statusStrip.Size = new Size(1463, 26);
+        statusStrip.Size = new Size(1463, 31);
         statusStrip.TabIndex = 2;
         // 
         // apiStatusLabel
         // 
+        apiStatusLabel.Font = new Font("Segoe UI", 11F, FontStyle.Bold);
         apiStatusLabel.Name = "apiStatusLabel";
-        apiStatusLabel.Size = new Size(482, 20);
+        apiStatusLabel.Size = new Size(469, 25);
         apiStatusLabel.Spring = true;
         apiStatusLabel.Text = "API: Idle";
         // 
         // cameraStatusLabel
         // 
+        cameraStatusLabel.Font = new Font("Segoe UI", 11F, FontStyle.Bold);
         cameraStatusLabel.Name = "cameraStatusLabel";
-        cameraStatusLabel.Size = new Size(482, 20);
+        cameraStatusLabel.Size = new Size(469, 25);
         cameraStatusLabel.Spring = true;
         cameraStatusLabel.Text = "Cameras: Idle";
         // 
         // gateStatusLabel
         // 
+        gateStatusLabel.Font = new Font("Segoe UI", 11F, FontStyle.Bold);
         gateStatusLabel.Name = "gateStatusLabel";
-        gateStatusLabel.Size = new Size(482, 20);
+        gateStatusLabel.Size = new Size(469, 25);
         gateStatusLabel.Spring = true;
         gateStatusLabel.Text = "Gate: Idle";
         // 

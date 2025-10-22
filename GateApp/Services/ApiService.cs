@@ -562,6 +562,7 @@ public sealed class ApiService : IDisposable
         var statusText = TryGetStringCaseInsensitive(root, "status");
         var success = IsSuccessfulStatus(statusText);
         var message = TryGetStringCaseInsensitive(root, "msg") ?? string.Empty;
+        var data = TryGetStringCaseInsensitive(root, "data");
 
         Dictionary<string, string>? additionalData = null;
         string? ticketId = null;
@@ -667,6 +668,7 @@ public sealed class ApiService : IDisposable
             TicketId = ticketId,
             PlateNumber = plateNumber,
             DriverName = driverName,
+            Data = data,
             AdditionalData = additionalData
         };
     }

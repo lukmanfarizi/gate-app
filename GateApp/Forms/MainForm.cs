@@ -257,48 +257,58 @@ public partial class MainForm : Form
                 }
             }
 
-            await InvokeAsync(() => UpdateStatus(cameraStatusLabel, "Cameras: Capturing")).ConfigureAwait(false);
-            var snapshots = await _cameraService.CaptureSnapshotsAsync(token).ConfigureAwait(false);
-            LogMessage($"Captured {snapshots.Count} snapshots");
+            string statusOpen = "CLOSED";
+            if (validateResponse.AdditionalData.TryGetValue("GATEINSTRUCTION", out statusOpen) && statusOpen == "OPEN")
+            {
+                await InvokeAsync(() => UpdateStatus(gateStatusLabel, "Result Status: Opening")).ConfigureAwait(false);
 
-            await InvokeAsync(() => UpdateStatus(apiStatusLabel, "API: Uploading Capture")).ConfigureAwait(false);
-            var captureUploaded = await _apiService.SendCaptureAsync(qrCode,
-                                                                     validateResponse.TicketId ?? qrCode,
-                                                                     _settings.Gate.Id,
-                                                                     snapshots,
-                                                                     additionalPayload,
-                                                                     token).ConfigureAwait(false);
-            if (!captureUploaded)
-            {
-                LogMessage("Capture upload failed. Continuing workflow.");
-            }
-            else
-            {
-                LogMessage("Capture uploaded successfully.");
-            }
+                await InvokeAsync(() => UpdateStatus(cameraStatusLabel, "Cameras: Capturing")).ConfigureAwait(false);
+                var snapshots = await _cameraService.CaptureSnapshotsAsync(token).ConfigureAwait(false);
+                LogMessage($"Captured {snapshots.Count} snapshots");
 
-            await InvokeAsync(() => UpdateStatus(gateStatusLabel, "Gate: Opening")).ConfigureAwait(false);
-            var gateOpened = await _gateControllerClient.OpenGateAsync(token).ConfigureAwait(false);
-            if (gateOpened)
-            {
-                LogMessage("Gate open command sent.");
-                await InvokeAsync(() => UpdateStatus(gateStatusLabel, "Gate: Open command sent")).ConfigureAwait(false);
-            }
-            else
-            {
-                LogMessage("Failed to open gate. Operator intervention required.");
-                await InvokeAsync(() => UpdateStatus(gateStatusLabel, "Gate: Error")).ConfigureAwait(false);
-            }
+                await InvokeAsync(() => UpdateStatus(apiStatusLabel, "API: Uploading Capture")).ConfigureAwait(false);
+                //var captureUploaded = await _apiService.SendCaptureAsync(qrCode,
+                //                                                         validateResponse.TicketId ?? qrCode,
+                //                                                         _settings.Gate.Id,
+                //                                                         snapshots,
+                //                                                         additionalPayload,
+                //                                                         token).ConfigureAwait(false);
+                //if (!captureUploaded)
+                //{
+                //    LogMessage("Capture upload failed. Continuing workflow.");
+                //}
+                //else
+                //{
+                //    LogMessage("Capture uploaded successfully.");
+                //}
 
-            await _printService.PrintReceiptAsync(validateResponse, token).ConfigureAwait(false);
-            LogMessage("Print job dispatched.");
-            await InvokeAsync(() =>
+                await InvokeAsync(() => UpdateStatus(gateStatusLabel, "Gate: Opening")).ConfigureAwait(false);
+                var gateOpened = await _gateControllerClient.OpenGateAsync(token).ConfigureAwait(false);
+                if (gateOpened)
+                {
+                    LogMessage("Gate open command sent.");
+                    await InvokeAsync(() => UpdateStatus(gateStatusLabel, "Gate: Open command sent")).ConfigureAwait(false);
+                }
+                else
+                {
+                    LogMessage("Failed to open gate. Operator intervention required.");
+                    await InvokeAsync(() => UpdateStatus(gateStatusLabel, "Gate: Error")).ConfigureAwait(false);
+                }
+
+                await _printService.PrintReceiptAsync(validateResponse, token).ConfigureAwait(false);
+                LogMessage("Print job dispatched.");
+                await InvokeAsync(() =>
+                {
+                    UpdateStatus(apiStatusLabel, "API: Ready");
+                    UpdateCameraButtons();
+                    UpdateCameraStatus();
+                    UpdateStatus(gateStatusLabel, gateOpened ? "Gate: Open" : "Gate: Error");
+                }).ConfigureAwait(false);
+            } else
             {
-                UpdateStatus(apiStatusLabel, "API: Ready");
-                UpdateCameraButtons();
-                UpdateCameraStatus();
-                UpdateStatus(gateStatusLabel, gateOpened ? "Gate: Open" : "Gate: Error");
-            }).ConfigureAwait(false);
+                LogMessage("Result Status: Closed");
+                await InvokeAsync(() => UpdateStatus(gateStatusLabel, "Result Status: Closed")).ConfigureAwait(false);
+            }
         }
         catch (Exception ex)
         {
@@ -349,15 +359,20 @@ public partial class MainForm : Form
             LogMessage($"    Driver: {response.DriverName}");
         }
 
+        if (!string.IsNullOrWhiteSpace(response.Data))
+        {
+            LogMessage($"    Data: {response.Data}");
+        }
+
         if (response.AdditionalData is null)
         {
             return;
         }
 
-        foreach (var item in response.AdditionalData)
-        {
-            LogMessage($"    {item.Key}: {item.Value}");
-        }
+        //foreach (var item in response.AdditionalData)
+        //{
+        //    LogMessage($"    {item.Key}: {item.Value}");
+        //}
     }
 
     private void LogMessage(string message)

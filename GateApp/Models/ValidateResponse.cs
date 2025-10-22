@@ -9,5 +9,6 @@ public sealed class ValidateResponse
     public string? TicketId { get; init; }
     public string? PlateNumber { get; init; }
     public string? DriverName { get; init; }
+    public string? Data { get; set; }
     public IDictionary<string, string>? AdditionalData { get; init; }
 }
